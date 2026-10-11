@@ -1,0 +1,327 @@
+#!/usr/bin/env perl
+# mpsplit - split Google Motion Photos (<name>.MP.jpg) into <name>.jpg and <name>.mp4
+# Spec: https://developer.android.com/media/platform/motion-photo-format
+# Errors: die("message\n"), caught per file in process_file().
+
+use strict;
+use warnings;
+use File::Basename qw(basename);
+use File::Find ();
+use File::Path qw(make_path);
+use File::stat ();
+use Getopt::Long qw(GetOptions);
+use Image::ExifTool;
+
+our $VERSION = '1.0';
+
+my $MP_SUFFIX = qr/\.mp\.jpg\z/i;
+
+# Remove C2PA (JUMBF): our edits break its signature, which would read as "tampered".
+my @PHOTO_DELETE = qw(
+    JUMBF:all
+    XMP-GCamera:MotionPhoto XMP-GCamera:MotionPhotoVersion
+    XMP-GCamera:MotionPhotoPresentationTimestampUs
+    XMP-GCamera:MicroVideo XMP-GCamera:MicroVideoVersion
+    XMP-GCamera:MicroVideoOffset XMP-GCamera:MicroVideoPresentationTimestampUs
+);
+
+my @PHOTO_TAGS = qw(
+    XMP-GContainer:ContainerDirectory XMP-GCamera:MicroVideoOffset
+    IFD0:Make IFD0:Model
+    Composite:GPSLatitude Composite:GPSLongitude Composite:GPSAltitude
+    Composite:SubSecDateTimeOriginal ExifIFD:DateTimeOriginal
+);
+
+my @QT_DATES = qw(
+    CreateDate ModifyDate TrackCreateDate TrackModifyDate
+    MediaCreateDate MediaModifyDate
+);
+
+my $USAGE = <<'EOF';
+Usage: mpsplit [-o OUTDIR] PATH...
+
+Split Google Motion Photos into a still photo and a video.
+
+PATH is a directory (searched recursively for *.MP.jpg, case-insensitive)
+or a single *.MP.jpg file. For every <name>.MP.jpg, two files are written
+next to it (or into OUTDIR if -o is given):
+
+  <name>.jpg   photo with all metadata, minus motion-photo XMP and C2PA
+  <name>.mp4   embedded video, enriched with GPS/make/model from the photo
+
+Options:
+  -o OUTDIR   write outputs to OUTDIR (created if needed) instead of next
+              to the source; subdirectory structure is not recreated
+  -h, --help  show this help
+  --version   show the version
+
+The source files are never modified. Files whose targets already exist
+are skipped. Exit code: 0 = OK, 1 = some files failed, 2 = usage error.
+EOF
+
+sub help    { print $USAGE; exit 0 }
+sub version { print "mpsplit $VERSION\n"; exit 0 }
+
+sub usage_error {
+    print STDERR "mpsplit: $_[0]\n" if @_;
+    print STDERR $USAGE;
+    exit 2;
+}
+
+sub main {
+    $| = 1;
+    Getopt::Long::Configure(qw(bundling no_ignore_case));
+    GetOptions('o=s' => \my $outdir, 'h|help' => \&help, 'version' => \&version)
+        or usage_error();
+    @ARGV or usage_error();
+    if (defined $outdir) {
+        eval { make_path($outdir); 1 } && -d $outdir
+            or usage_error("cannot create output directory: $outdir");
+    }
+
+    my %count = (split => 0, warning => 0, exists => 0, notmotion => 0, error => 0);
+    my $report = sub {
+        my ($status, $msg) = @_;
+        $count{$status}++;
+        $count{warning}++ if $status eq 'split' && defined $msg;
+        print STDERR "  ! $msg\n" if defined $msg;
+    };
+
+    my %claimed;    # output path => source; detects name collisions with -o
+    for my $path (@ARGV) {
+        if (-d $path) {
+            $report->(process_file($_, $outdir, \%claimed)) for find_motion_photos($path);
+        } elsif (-f $path) {
+            $report->(process_file($path, $outdir, \%claimed));
+        } else {
+            $report->(error => "no such file or directory: $path");
+        }
+    }
+
+    printf "\nsplit: %d (with warnings: %d)   skipped (exists): %d   not motion: %d   errors: %d\n",
+        @count{qw(split warning exists notmotion error)};
+    return $count{error} ? 1 : 0;
+}
+
+sub find_motion_photos {
+    my $dir = shift;
+    my @files;
+    File::Find::find({
+        no_chdir => 1,
+        wanted   => sub { push @files, $_ if -f $_ && $_ =~ $MP_SUFFIX },
+    }, $dir);
+    return sort @files;
+}
+
+# Returns (status, message); a 'split' with a message is a warning.
+sub process_file {
+    my ($src, $outdir, $claimed) = @_;
+    print "$src\n";
+
+    my ($jpg, $mp4) = output_paths($src, $outdir)
+        or return (notmotion => 'name does not end in .MP.jpg, skipped');
+    if (my $other = $claimed->{$jpg}) {
+        return (error => "output name collides with $other, skipped");
+    }
+    $claimed->{$jpg} = $src;
+    if (-e $jpg || -e $mp4) {
+        print "  = skipped, target exists\n";
+        return 'exists';
+    }
+
+    my @result = eval { split_file($src, $jpg, $mp4) }
+        or do { chomp(my $err = $@); return (error => $err) };
+    return @result;
+}
+
+sub split_file {
+    my ($src, $jpg, $mp4) = @_;
+    my $data = read_file($src);
+    check_jpeg(\$data);
+
+    my $info = read_tags(\$data, @PHOTO_TAGS);
+    my ($off, $vlen) = locate_video(length $data, $info)
+        or return (notmotion => 'not a motion photo (no video metadata), skipped');
+    is_mp4_at(\$data, $off) or die "no MP4 found at offset $off, skipped\n";
+
+    my $video = substr($data, $off, $vlen);
+    my $photo = clean_photo(\$data, $info, length($data) - $off);
+    my ($vout, $warning) = enrich_video(\$video, $info);
+
+    write_outputs($src, [ $jpg, \$photo ], [ $mp4, \$vout ]);
+    print '  -> ', basename($jpg), "\n  -> ", basename($mp4), "\n";
+    return (split => $warning);
+}
+
+sub check_jpeg {
+    my $data = shift;
+    # Separate read: with the Struct option, ExifTool omits Warning.
+    my $info = new_et()->ImageInfo($data, [qw(FileType Error Warning)]);
+    die "cannot read file: $info->{Error}, skipped\n" if defined $info->{Error};
+    die "not a JPEG file, skipped\n" if ($info->{FileType} // '') ne 'JPEG';
+    die "damaged JPEG ($info->{Warning}), skipped\n"
+        if ($info->{Warning} // '') =~ /^JPEG format error/;
+}
+
+sub output_paths {
+    my ($src, $outdir) = @_;
+    (my $base = $src) =~ s/$MP_SUFFIX// or return;
+    $base = "$outdir/" . basename($base) if defined $outdir;
+    return ("$base.jpg", "$base.mp4");
+}
+
+# Returns (offset, length), or () if not a motion photo.
+# V2: the MotionPhoto item is the last one, followed by Padding bytes up to EOF.
+# V1: MicroVideoOffset = bytes from video start to EOF.
+sub locate_video {
+    my ($size, $info) = @_;
+    if (my ($item) = grep { semantic($_) eq 'MotionPhoto' } container_items($info)) {
+        my $len = positive_int($item->{Length});
+        my $pad = $item->{Padding} // 0;
+        die "invalid MotionPhoto length/padding in Container directory\n"
+            unless defined $len && $pad =~ /^\d+\z/;
+        return ($size - $len - $pad, $len);
+    }
+    if (defined $info->{MicroVideoOffset}) {
+        my $len = positive_int($info->{MicroVideoOffset}) // die "invalid MicroVideoOffset\n";
+        return ($size - $len, $len);
+    }
+    return;
+}
+
+sub container_items {
+    my $dir = shift->{ContainerDirectory} // return;
+    return map { $_->{Item} // () } ref $dir eq 'ARRAY' ? @$dir : $dir;
+}
+
+sub semantic { $_[0]{Semantic} // '' }
+
+# Edits the full file before cutting off the video, so ExifTool fixes the
+# MPF (gain map) offsets.
+sub clean_photo {
+    my ($data, $info, $trailer) = @_;
+    my $et = new_et();
+    $et->SetNewValue($_) for @PHOTO_DELETE;
+
+    # Keep other items (e.g. GainMap) unchanged; drop the directory if only Primary is left.
+    my @keep = grep { semantic($_) ne 'MotionPhoto' } container_items($info);
+    my @dir  = (grep { semantic($_) ne 'Primary' } @keep) ? map { +{ Item => $_ } } @keep : ();
+    $et->SetNewValue('XMP-GContainer:ContainerDirectory' => @dir ? \@dir : undef);
+
+    my $photo = write_info($et, $data, 'clean photo metadata');
+    my $cut = length($photo) - $trailer;
+    is_mp4_at(\$photo, $cut) or die "video not found at end of rewritten photo, skipped\n";
+    substr($photo, $cut) = '';
+    return $photo;
+}
+
+# Returns ($video) or ($original_video, warning).
+sub enrich_video {
+    my ($video, $info) = @_;
+    my $et = new_et();
+
+    for my $tag (qw(Make Model)) {
+        $et->SetNewValue("Keys:$tag" => $info->{$tag}) if defined $info->{$tag};
+    }
+
+    my ($lat, $lon, $alt) = @$info{qw(GPSLatitude GPSLongitude GPSAltitude)};
+    if (defined $lat && defined $lon) {
+        my $coords = join ' ', grep { defined } $lat, $lon, $alt;
+        $et->SetNewValue($_ => $coords, Type => 'ValueConv')
+            for qw(Keys:GPSCoordinates UserData:GPSCoordinates);
+    }
+
+    my $date = $info->{SubSecDateTimeOriginal} // $info->{DateTimeOriginal};
+    if (defined $date) {
+        $et->SetNewValue('Keys:CreationDate' => $date);
+        # Pixel MP4s already have correct UTC dates; only fill in missing ones.
+        my $vdate = read_tags($video, 'QuickTime:CreateDate')->{CreateDate};
+        if (!defined $vdate || $vdate =~ /^0000/) {
+            $et->SetNewValue("QuickTime:$_" => $date) for @QT_DATES;
+        }
+    }
+
+    my $out = eval { write_info($et, $video, 'write video metadata') };
+    return $out if defined $out;
+    chomp(my $err = $@);
+    return ($$video, "$err (video kept as extracted)");
+}
+
+# All or nothing: temp files, then rename; on failure, removes what was renamed.
+sub write_outputs {
+    my ($src, @outputs) = @_;
+    my $st = File::stat::stat($src) or die "cannot stat $src: $!\n";
+    my @tmp = map { "$_->[0].tmp$$" } @outputs;
+    my @done;
+    eval {
+        for my $i (0 .. $#outputs) {
+            write_file($tmp[$i], ${ $outputs[$i][1] });
+            chmod($st->mode & 07777, $tmp[$i]) or die "chmod $tmp[$i]: $!\n";
+            utime($st->atime, $st->mtime, $tmp[$i]) or die "utime $tmp[$i]: $!\n";
+        }
+        for my $i (0 .. $#outputs) {
+            my $dst = $outputs[$i][0];
+            die "$dst appeared meanwhile\n" if -e $dst;
+            rename $tmp[$i], $dst or die "rename to $dst: $!\n";
+            push @done, $dst;
+        }
+        1;
+    } or do {
+        my $err = $@;
+        unlink @done, grep { -e } @tmp;
+        die "cannot write output: $err";
+    };
+}
+
+sub new_et {
+    my $et = Image::ExifTool->new;
+    $et->Options(IgnoreMinorErrors => 1, QuickTimeUTC => 1);
+    return $et;
+}
+
+sub read_tags {
+    my ($src, @tags) = @_;
+    my $et = new_et();
+    $et->Options(PrintConv => 0, List => 1, Struct => 1, Duplicates => 0);
+    return plain_keys($et->ImageInfo($src, \@tags));
+}
+
+# ExifTool names duplicates "Tag (1)"...; keep the first (sorts before "Tag (1)").
+sub plain_keys {
+    my $info = shift;
+    my %plain;
+    $plain{ Image::ExifTool::GetTagName($_) } //= $info->{$_} for sort keys %$info;
+    return \%plain;
+}
+
+sub write_info {
+    my ($et, $in, $what) = @_;
+    my $out;
+    $et->WriteInfo($in, \$out)
+        or die "cannot $what: ", $et->GetValue('Error') // 'unknown ExifTool error', "\n";
+    return $out;
+}
+
+sub read_file {
+    my $f = shift;
+    open my $fh, '<:raw', $f or die "cannot read $f: $!\n";
+    local $/;
+    return scalar(<$fh>) // die "cannot read $f: $!\n";
+}
+
+sub write_file {
+    my ($f, $data) = @_;
+    open my $fh, '>:raw', $f or die "cannot write $f: $!\n";
+    print {$fh} $data or die "cannot write $f: $!\n";
+    close $fh or die "cannot write $f: $!\n";
+}
+
+sub is_mp4_at {
+    my ($data, $off) = @_;
+    return $off >= 0 && $off + 8 <= length($$data) && substr($$data, $off + 4, 4) eq 'ftyp';
+}
+
+sub positive_int { my $v = shift; return defined $v && $v =~ /^\d+\z/ && $v > 0 ? $v : undef }
+
+exit main() unless caller;
+1;
